@@ -1,5 +1,8 @@
 # Enhanced FoundationPose (with New Features)
 [![Watch the video](https://img.youtube.com/vi/uCd3zJl0b6A/0.jpg)](https://youtu.be/uCd3zJl0b6A)
+
+中文用户请参阅：[项目使用说明](./USAGE_CN.md)。
+
 ## ToDo
 
 1. Add support for SAM2
