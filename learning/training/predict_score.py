@@ -24,7 +24,7 @@ from learning.datasets.pose_dataset import *
 from Utils import *
 from datareader import *
 
-from learning.models.tensorrt_models import ScoreNetTrt
+# TensorRT is optional and disabled for this deployment.
 USE_TRT = False
 
 def vis_batch_data_scores(pose_data, ids, scores, pad_margin=5):

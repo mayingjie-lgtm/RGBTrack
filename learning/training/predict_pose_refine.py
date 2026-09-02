@@ -19,7 +19,7 @@ from learning.models.refine_network import RefineNet
 from learning.datasets.h5_dataset import *
 from Utils import *
 from datareader import *
-from learning.models.tensorrt_models import RefineNetTrt
+# TensorRT is optional and disabled for this deployment.
 USE_TRT =False
 
 
