@@ -62,6 +62,9 @@ if __name__ == "__main__":
 
     debug = args.debug
     debug_dir = args.debug_dir
+    show_window = debug >= 1 and bool(os.environ.get("DISPLAY"))
+    if debug >= 1 and not show_window:
+        logging.info("No DISPLAY detected; saving debug visualization without cv2.imshow")
     os.system(
         f"rm -rf {debug_dir}/* && mkdir -p {debug_dir}/track_vis {debug_dir}/ob_in_cam"
     )
@@ -159,8 +162,9 @@ if __name__ == "__main__":
                 transparency=0,
                 is_input_rgb=True,
             )
-            cv2.imshow("1", vis[..., ::-1])
-            cv2.waitKey(1)
+            if show_window:
+                cv2.imshow("1", vis[..., ::-1])
+                cv2.waitKey(1)
 
         if debug >= 2:
             os.makedirs(f"{debug_dir}/track_vis", exist_ok=True)
