@@ -15,6 +15,22 @@ import numpy as np
 
 SAVE_VIDEO=False
 
+
+def assert_frame_shapes(color, expected_hw, mask=None, depth=None):
+    """Validate RGB, mask, and pseudo-depth against the reader output size."""
+    assert color.shape[:2] == expected_hw, (
+        f"RGB shape {color.shape[:2]} does not match reader shape {expected_hw}"
+    )
+    if mask is not None:
+        assert mask.shape[:2] == expected_hw, (
+            f"Mask shape {mask.shape[:2]} does not match reader shape {expected_hw}"
+        )
+    if depth is not None:
+        assert depth.shape[:2] == expected_hw, (
+            f"Depth shape {depth.shape[:2]} does not match reader shape {expected_hw}"
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -74,8 +90,11 @@ if __name__ == "__main__":
 
     for i in range(len(reader.color_files)):
         color = reader.get_color(i)
+        expected_hw = (reader.H, reader.W)
+        assert_frame_shapes(color, expected_hw)
         if i == 0:
             mask = reader.get_mask(0).astype(bool)
+            assert_frame_shapes(color, expected_hw, mask=mask)
             last_mask= mask
             t1=time.time()
             pose= binary_search_depth(
@@ -110,7 +129,14 @@ if __name__ == "__main__":
             if args.mode==0:
                 last_depth = np.zeros_like(last_mask)
             elif args.mode==1:
-                last_depth = render_cad_depth(pose, mesh, reader.K)
+                last_depth = render_cad_depth(
+                    pose,
+                    mesh,
+                    reader.K,
+                    w=reader.W,
+                    h=reader.H,
+                )
+            assert_frame_shapes(color, expected_hw, depth=last_depth)
             pose = est.track_one(
                 rgb=color, depth=last_depth, K=reader.K, iteration=args.track_refine_iter
             )
