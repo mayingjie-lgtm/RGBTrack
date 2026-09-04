@@ -31,6 +31,12 @@ if __name__ == "__main__":
     parser.add_argument("--debug", type=int, default=1)
     parser.add_argument("--debug_dir", type=str, default=f"{code_dir}/debug")
     parser.add_argument("--mode", type=int, default=0)
+    parser.add_argument(
+        "--shorter_side",
+        type=int,
+        default=480,
+        help="Resize the shorter image side to limit pose-scoring GPU memory use.",
+    )
     args = parser.parse_args()
 
     set_logging_format()
@@ -63,7 +69,7 @@ if __name__ == "__main__":
     logging.info("estimator initialization done")
 
     reader = YcbineoatReader(
-        video_dir=args.test_scene_dir, shorter_side=None, zfar=np.inf
+        video_dir=args.test_scene_dir, shorter_side=args.shorter_side, zfar=np.inf
     )
 
     for i in range(len(reader.color_files)):
@@ -72,7 +78,16 @@ if __name__ == "__main__":
             mask = reader.get_mask(0).astype(bool)
             last_mask= mask
             t1=time.time()
-            pose= binary_search_depth(est, mesh, color, mask, reader.K, debug=True)
+            pose= binary_search_depth(
+                est,
+                mesh,
+                color,
+                mask,
+                reader.K,
+                w=reader.W,
+                h=reader.H,
+                debug=True,
+            )
 
             # pose = est.register_without_depth(
             #     K=reader.K,

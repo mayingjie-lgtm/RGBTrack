@@ -3,6 +3,11 @@ __pycache__/
 
 debug/
 demo_data/
+!demo_data/
+demo_data/*
+!demo_data/zhuying/
+demo_data/zhuying/*
+!demo_data/zhuying/cam_D.txt
 downloads/
 weights/
 mycpp/build/

@@ -21,6 +21,7 @@ RGBTrack 是一个基于 Enhanced FoundationPose 的物体 6D 位姿估计与连
 | --- | --- |
 | CAD 网格 | 目标物体的 OBJ 等三维模型；模型尺度应与真实物体一致 |
 | `cam_K.txt` | 3×3 相机内参矩阵 |
+| `cam_D.txt`（可选） | OpenCV pinhole 畸变参数 `k1 k2 p1 p2 k3`，一行恰好五项 |
 | `rgb/*.png` | 按文件名排序的 RGB 图像序列 |
 | `masks/*.png` | 与首帧 RGB 同名的目标二值掩码 |
 
@@ -29,6 +30,7 @@ RGBTrack 是一个基于 Enhanced FoundationPose 的物体 6D 位姿估计与连
 ```text
 demo_data/mustard0/
 ├── cam_K.txt
+├── cam_D.txt              # 可选
 ├── mesh/
 │   ├── textured_simple.obj
 │   ├── textured_simple.obj.mtl
@@ -38,6 +40,8 @@ demo_data/mustard0/
 └── masks/
     └── <first_frame_id>.png
 ```
+
+存在 `cam_D.txt` 时，`YcbineoatReader` 会以 `alpha=0` 自动去畸变，并对 RGB、目标 mask、深度和遮挡 mask 使用同一映射。输出分辨率保持 Reader 的目标尺寸；此时 `reader.K` 是去畸变后图像对应的新内参，而 `cam_K.txt` 始终保留相机的原始标定内参。没有 `cam_D.txt` 时保持原有缩放行为。
 
 程序默认将结果写入 `debug/`：
 
@@ -87,6 +91,7 @@ python3 run_demo_without_depth.py \
 | `--debug` | `1` | `0` 关闭可视化，`1` 窗口显示，`2` 同时保存图像 |
 | `--debug_dir` | `./debug` | 位姿矩阵和调试结果的输出目录 |
 | `--mode` | `0` | `0` 使用零深度跟踪，`1` 使用 CAD 模型渲染的深度跟踪 |
+| `--shorter_side` | `480` | 将输入短边缩放到指定像素数，限制候选姿态评分的显存占用 |
 
 增加细化次数通常可以提高稳定性，但会降低处理速度。
 

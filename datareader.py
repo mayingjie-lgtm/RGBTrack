@@ -64,25 +64,68 @@ def get_bop_video_dirs(dataset):
 
 class YcbineoatReader:
     def __init__(self, video_dir, downscale=1, shorter_side=None, zfar=np.inf):
+        """Initialize a reader and optional pinhole undistortion maps.
+
+        Args:
+            video_dir: Dataset directory containing camera files and image folders.
+            downscale: Scale applied to the source image dimensions.
+            shorter_side: Optional target length for the shorter image side.
+            zfar: Depth values at or beyond this distance are invalidated.
+        """
         self.video_dir = video_dir
         self.downscale = downscale
         self.zfar = zfar
         self.color_files = sorted(glob.glob(f"{self.video_dir}/rgb/*.png"))
-        self.K = np.loadtxt(f"{video_dir}/cam_K.txt").reshape(3, 3)
+        self.original_K = np.loadtxt(f"{video_dir}/cam_K.txt").reshape(3, 3)
+        self.K = self.original_K.copy()
+        self.D = None
+        distortion_file = f"{video_dir}/cam_D.txt"
+        if os.path.exists(distortion_file):
+            try:
+                distortion = np.asarray(np.loadtxt(distortion_file)).reshape(-1)
+            except ValueError as error:
+                raise ValueError(
+                    f"{distortion_file} must contain exactly 5 numeric values "
+                    "[k1, k2, p1, p2, k3]"
+                ) from error
+            if distortion.size != 5:
+                raise ValueError(
+                    f"{distortion_file} must contain exactly 5 numeric values "
+                    "[k1, k2, p1, p2, k3]"
+                )
+            self.D = distortion
         self.id_strs = []
 
         for color_file in self.color_files:
             id_str = os.path.basename(color_file).replace(".png", "")
             self.id_strs.append(id_str)
         logging.info(f"Found {len(self.color_files)} frames in {video_dir}")
-        self.H, self.W = cv2.imread(self.color_files[0]).shape[:2]
+        self.source_H, self.source_W = cv2.imread(self.color_files[0]).shape[:2]
 
         if shorter_side is not None:
-            self.downscale = shorter_side / min(self.H, self.W)
+            self.downscale = shorter_side / min(self.source_H, self.source_W)
 
-        self.H = int(self.H * self.downscale)
-        self.W = int(self.W * self.downscale)
-        self.K[:2] *= self.downscale
+        self.H = int(self.source_H * self.downscale)
+        self.W = int(self.source_W * self.downscale)
+        self._undistort_maps = None
+        if self.D is not None:
+            self.K, _ = cv2.getOptimalNewCameraMatrix(
+                self.original_K,
+                self.D,
+                (self.source_W, self.source_H),
+                0,
+                (self.W, self.H),
+            )
+            self._undistort_maps = cv2.initUndistortRectifyMap(
+                self.original_K,
+                self.D,
+                None,
+                self.K,
+                (self.W, self.H),
+                cv2.CV_32FC1,
+            )
+        else:
+            self.K[:2] *= self.downscale
 
         self.gt_pose_files = sorted(glob.glob(f"{self.video_dir}/annotated_poses/*"))
 
@@ -113,11 +156,12 @@ class YcbineoatReader:
             return None
 
     def get_color(self, i):
+        """Return an RGB frame transformed to the reader output geometry."""
         color = imageio.imread(self.color_files[i])[..., :3]
-        color = cv2.resize(color, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-        return color
+        return self._transform_image(color, cv2.INTER_LINEAR)
 
     def get_mask(self, i):
+        """Return the object mask aligned with the transformed RGB frame."""
         try:
             mask = cv2.imread(self.color_files[i].replace("rgb", "masks"), -1)
             if len(mask.shape) == 3:
@@ -125,11 +169,8 @@ class YcbineoatReader:
                     if mask[..., c].sum() > 0:
                         mask = mask[..., c]
                         break
-            mask = (
-                cv2.resize(mask, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-                .astype(bool)
-                .astype(np.uint8)
-            )
+            mask = self._transform_image(mask, cv2.INTER_NEAREST)
+            mask = mask.astype(bool).astype(np.uint8)
         except:
             mask = cv2.imread(self.color_files[i].replace("rgb", "gt_mask"), -1)
             if len(mask.shape) == 3:
@@ -137,18 +178,40 @@ class YcbineoatReader:
                     if mask[..., c].sum() > 0:
                         mask = mask[..., c]
                         break
-            mask = (
-                cv2.resize(mask, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-                .astype(bool)
-                .astype(np.uint8)
-            )
+            mask = self._transform_image(mask, cv2.INTER_NEAREST)
+            mask = mask.astype(bool).astype(np.uint8)
         return mask
 
     def get_depth(self, i):
+        """Return depth in metres aligned with the transformed RGB frame."""
         depth = cv2.imread(self.color_files[i].replace("rgb", "depth"), -1) / 1e3
-        depth = cv2.resize(depth, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
+        depth = self._transform_image(depth, cv2.INTER_NEAREST)
         depth[(depth < 0.001) | (depth >= self.zfar)] = 0
         return depth
+
+    def _transform_image(self, image, interpolation):
+        """Transform an image to output geometry using shared undistortion maps.
+
+        Args:
+            image: Source image in the camera's original pixel geometry.
+            interpolation: OpenCV interpolation used when undistortion is enabled.
+
+        Returns:
+            An image of size ``self.W`` by ``self.H``. Without distortion data,
+            the legacy nearest-neighbour resize behavior is preserved.
+        """
+        if self._undistort_maps is None:
+            return cv2.resize(
+                image, (self.W, self.H), interpolation=cv2.INTER_NEAREST
+            )
+        return cv2.remap(
+            image,
+            self._undistort_maps[0],
+            self._undistort_maps[1],
+            interpolation=interpolation,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
 
     def get_upscale_rgb(self, i):
         color = imageio.imread(
@@ -164,8 +227,9 @@ class YcbineoatReader:
         return xyz_map
 
     def get_occ_mask(self, i):
+        """Return the combined hand-occlusion mask in output image geometry."""
         hand_mask_file = self.color_files[i].replace("rgb", "masks_hand")
-        occ_mask = np.zeros((self.H, self.W), dtype=bool)
+        occ_mask = np.zeros((self.source_H, self.source_W), dtype=bool)
         if os.path.exists(hand_mask_file):
             occ_mask = occ_mask | (cv2.imread(hand_mask_file, -1) > 0)
 
@@ -173,9 +237,7 @@ class YcbineoatReader:
         if os.path.exists(right_hand_mask_file):
             occ_mask = occ_mask | (cv2.imread(right_hand_mask_file, -1) > 0)
 
-        occ_mask = cv2.resize(
-            occ_mask, (self.W, self.H), interpolation=cv2.INTER_NEAREST
-        )
+        occ_mask = self._transform_image(occ_mask.astype(np.uint8), cv2.INTER_NEAREST)
 
         return occ_mask.astype(np.uint8)
 
