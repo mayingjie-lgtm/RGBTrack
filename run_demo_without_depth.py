@@ -11,6 +11,7 @@ from estimater import *
 from datareader import *
 import argparse
 from tools import *
+from xmem_wrapper import XMemMaskTracker, overlay_davis
 import numpy as np
 
 SAVE_VIDEO=False
@@ -31,6 +32,32 @@ def assert_frame_shapes(color, expected_hw, mask=None, depth=None):
         )
 
 
+def normalize_xmem_mask(mask, expected_hw):
+    """Return a boolean XMem mask at reader resolution and flag tiny masks invalid."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != expected_hw:
+        mask = cv2.resize(
+            mask.astype(np.uint8),
+            (expected_hw[1], expected_hw[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+    min_pixels = max(16, int(expected_hw[0] * expected_hw[1] * 1e-4))
+    return mask, int(mask.sum()) >= min_pixels
+
+
+def save_xmem_debug(debug_dir, frame_name, color, mask):
+    """Save the propagated binary mask and an RGB overlay for visual inspection."""
+    mask_dir = os.path.join(debug_dir, "xmem_mask")
+    vis_dir = os.path.join(debug_dir, "xmem_vis")
+    os.makedirs(mask_dir, exist_ok=True)
+    os.makedirs(vis_dir, exist_ok=True)
+    imageio.imwrite(os.path.join(mask_dir, f"{frame_name}.png"), mask.astype(np.uint8) * 255)
+    imageio.imwrite(
+        os.path.join(vis_dir, f"{frame_name}.png"),
+        overlay_davis(color, mask.astype(np.uint8)),
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -47,6 +74,11 @@ if __name__ == "__main__":
     parser.add_argument("--debug", type=int, default=1)
     parser.add_argument("--debug_dir", type=str, default=f"{code_dir}/debug")
     parser.add_argument("--mode", type=int, default=0)
+    parser.add_argument(
+        "--use_xmem",
+        action="store_true",
+        help="Propagate the first-frame object mask with XMem for diagnostics.",
+    )
     parser.add_argument(
         "--shorter_side",
         type=int,
@@ -90,6 +122,7 @@ if __name__ == "__main__":
     reader = YcbineoatReader(
         video_dir=args.test_scene_dir, shorter_side=args.shorter_side, zfar=np.inf
     )
+    xmem_tracker = XMemMaskTracker() if args.use_xmem else None
 
     for i in range(len(reader.color_files)):
         color = reader.get_color(i)
@@ -99,6 +132,14 @@ if __name__ == "__main__":
             mask = reader.get_mask(0).astype(bool)
             assert_frame_shapes(color, expected_hw, mask=mask)
             last_mask= mask
+            if xmem_tracker is not None:
+                xmem_tracker.initialize(color, mask)
+                current_mask, mask_valid = normalize_xmem_mask(mask, expected_hw)
+                logging.info(
+                    f"[XMEM] frame={i} valid={mask_valid} area={int(current_mask.sum())}"
+                )
+                if debug >= 2:
+                    save_xmem_debug(debug_dir, reader.id_strs[i], color, current_mask)
             t1=time.time()
             pose= binary_search_depth(
                 est,
@@ -128,6 +169,14 @@ if __name__ == "__main__":
                 fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Codec for .avi format
                 video_writer = cv2.VideoWriter(output_video_path, fourcc, fps, (640, 480))
         else:
+            if xmem_tracker is not None:
+                current_mask = xmem_tracker.propagate(color)
+                current_mask, mask_valid = normalize_xmem_mask(current_mask, expected_hw)
+                logging.info(
+                    f"[XMEM] frame={i} valid={mask_valid} area={int(current_mask.sum())}"
+                )
+                if debug >= 2:
+                    save_xmem_debug(debug_dir, reader.id_strs[i], color, current_mask)
             t1=time.time()
             if args.mode==0:
                 last_depth = np.zeros_like(last_mask)

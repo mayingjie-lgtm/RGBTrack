@@ -11,6 +11,7 @@ from inference.data.mask_mapper import MaskMapper
 from model.network import XMem
 from inference.inference_core import InferenceCore
 from inference.interact.interactive_utils import image_to_torch, index_numpy_to_one_hot_torch, torch_prob_to_numpy_mask, overlay_davis
+from torch.cuda.amp import autocast
 
 # default configuration
 config = {
@@ -27,6 +28,52 @@ config = {
 
 torch.set_grad_enabled(False)
 torch.cuda.empty_cache()
+
+
+class XMemMaskTracker:
+    """Propagate a single binary object mask with the bundled XMem model."""
+
+    def __init__(self, model_path=None, device="cuda"):
+        """Load XMem weights and create an inference processor for one object."""
+        if model_path is None:
+            model_path = os.path.join(XMEM_PATH, "saves", "XMem.pth")
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"XMem weights not found: {model_path}")
+
+        self.device = device
+        self.config = dict(config)
+        self.network = XMem(self.config, model_path).eval().to(device)
+        self.processor = InferenceCore(self.network, config=self.config)
+        self.processor.set_all_labels([1])
+        self.initialized = False
+
+    def initialize(self, rgb, mask):
+        """Seed XMem memory from an RGB frame and its binary object mask."""
+        mask = np.asarray(mask, dtype=bool)
+        if rgb.shape[:2] != mask.shape:
+            raise ValueError(
+                f"XMem RGB shape {rgb.shape[:2]} does not match mask shape {mask.shape}"
+            )
+        if not np.any(mask):
+            raise ValueError("XMem initialization mask is empty")
+
+        frame_torch, _ = image_to_torch(rgb, device=self.device)
+        mask_index = mask.astype(np.uint8)
+        mask_torch = index_numpy_to_one_hot_torch(mask_index, 2).to(self.device)
+        with autocast(enabled=self.device.startswith("cuda")):
+            prediction = self.processor.step(frame_torch, mask_torch[1:])
+        self.initialized = True
+        return torch_prob_to_numpy_mask(prediction) == 1
+
+    def propagate(self, rgb):
+        """Propagate the initialized object mask to the next RGB frame."""
+        if not self.initialized:
+            raise RuntimeError("XMemMaskTracker must be initialized before propagation")
+
+        frame_torch, _ = image_to_torch(rgb, device=self.device)
+        with autocast(enabled=self.device.startswith("cuda")):
+            prediction = self.processor.step(frame_torch)
+        return torch_prob_to_numpy_mask(prediction) == 1
 
 
 # class yolo_wrapper:
