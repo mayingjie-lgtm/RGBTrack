@@ -1,9 +1,10 @@
 from estimater import *
 from datareader import *
+import os
 # from ultralytics import YOLO
 # from ultralytics.utils.plotting import Annotator, colors
 
-XMEM_PATH = './XMem'
+XMEM_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "XMem")
 sys.path.append(XMEM_PATH)
 from inference.data.test_datasets import LongTestDataset, DAVISTestDataset, YouTubeVOSTestDataset
 from inference.data.mask_mapper import MaskMapper
