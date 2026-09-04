@@ -143,6 +143,12 @@ if __name__ == "__main__":
         default=0.30,
         help="Mark pose tracking lost below this mask/CAD silhouette IoU.",
     )
+    parser.add_argument(
+        "--relocalize_cooldown",
+        type=int,
+        default=5,
+        help="Minimum frame gap between automatic pose re-registration attempts.",
+    )
     args = parser.parse_args()
 
     set_logging_format()
@@ -197,9 +203,19 @@ if __name__ == "__main__":
         "cad_mask_area",
         "mask_valid",
         "tracking_state",
+        "pre_relocalize_iou",
+        "pre_relocalize_center_ratio",
+        "relocalization_attempted",
+        "relocalization_count",
+        "successful_relocalization",
+        "failed_relocalization",
     ]
     metrics_writer = csv.DictWriter(metrics_file, fieldnames=metrics_fields)
     metrics_writer.writeheader()
+    last_relocalize_frame = -args.relocalize_cooldown
+    relocalization_count = 0
+    successful_relocalization = 0
+    failed_relocalization = 0
 
     for i in range(len(reader.color_files)):
         color = reader.get_color(i)
@@ -294,14 +310,96 @@ if __name__ == "__main__":
             metrics["center_distance_ratio"] > args.relocalize_center_ratio
             or metrics["mask_iou"] < args.relocalize_iou
         )
+        pre_relocalize_iou = metrics["mask_iou"]
+        pre_relocalize_center_ratio = metrics["center_distance_ratio"]
+        relocalization_attempted = False
+
         if not mask_valid:
             tracking_state = "LOST_MASK"
+            logging.info(f"[LOST_MASK] frame={i}")
         elif pose_bad:
             tracking_state = "LOST"
+            logging.info(
+                f"[LOST] frame={i} IoU={metrics['mask_iou']:.3f} "
+                f"center_error={metrics['center_distance_ratio']:.3f}"
+            )
+            cooldown_ready = (i - last_relocalize_frame) >= args.relocalize_cooldown
+            if i > 0 and xmem_tracker is not None and cooldown_ready:
+                relocalization_attempted = True
+                relocalization_count += 1
+                last_relocalize_frame = i
+                tracking_state = "RELOCALIZE"
+                logging.info(f"[RELOCALIZE] frame={i}")
+                try:
+                    pose = binary_search_depth(
+                        est,
+                        mesh,
+                        color,
+                        current_mask,
+                        reader.K,
+                        w=reader.W,
+                        h=reader.H,
+                        debug=False,
+                        iteration=args.est_refine_iter,
+                    )
+                    cad_mask = render_cad_silhouette(
+                        pose,
+                        mesh,
+                        reader.K,
+                        w=reader.W,
+                        h=reader.H,
+                        glctx=glctx,
+                        mesh_tensors=cad_mesh_tensors,
+                    )
+                    metrics = calculate_tracking_metrics(
+                        current_mask,
+                        cad_mask,
+                        mask_valid,
+                        image_width=reader.W,
+                        image_height=reader.H,
+                    )
+                    pose_bad_after = (
+                        metrics["center_distance_ratio"] > args.relocalize_center_ratio
+                        or metrics["mask_iou"] < args.relocalize_iou
+                    )
+                    if pose_bad_after:
+                        failed_relocalization += 1
+                        tracking_state = "RELOCALIZE_FAILED"
+                        logging.info(
+                            f"[RELOCALIZE_FAILED] frame={i} IoU={metrics['mask_iou']:.3f} "
+                            f"center_error={metrics['center_distance_ratio']:.3f}"
+                        )
+                    else:
+                        successful_relocalization += 1
+                        tracking_state = "RELOCALIZE_OK"
+                        logging.info(
+                            f"[RELOCALIZE_OK] frame={i} IoU={metrics['mask_iou']:.3f} "
+                            f"center_error={metrics['center_distance_ratio']:.3f}"
+                        )
+                except Exception as exc:
+                    failed_relocalization += 1
+                    tracking_state = "RELOCALIZE_FAILED"
+                    logging.exception(f"[RELOCALIZE_FAILED] frame={i} error={exc}")
+                t2 = time.time()
         else:
             tracking_state = "TRACK"
+            logging.info(
+                f"[TRACK] frame={i} IoU={metrics['mask_iou']:.3f} "
+                f"center_error={metrics['center_distance_ratio']:.3f}"
+            )
+
         metrics_writer.writerow(
-            {"frame_id": i, **metrics, "tracking_state": tracking_state}
+            {
+                "frame_id": i,
+                **metrics,
+                "tracking_state": tracking_state,
+                "pre_relocalize_iou": pre_relocalize_iou,
+                "pre_relocalize_center_ratio": pre_relocalize_center_ratio,
+                "relocalization_attempted": relocalization_attempted,
+                "relocalization_count": relocalization_count,
+                "successful_relocalization": successful_relocalization,
+                "failed_relocalization": failed_relocalization,
+            }
         )
         metrics_file.flush()
 
@@ -352,3 +450,7 @@ if __name__ == "__main__":
             video_writer.write(vis[..., ::-1])
 
     metrics_file.close()
+    logging.info(
+        f"Relocalization summary: total={relocalization_count} "
+        f"successful={successful_relocalization} failed={failed_relocalization}"
+    )
