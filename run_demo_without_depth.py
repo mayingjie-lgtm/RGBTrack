@@ -6,6 +6,7 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+import csv
 import time
 from estimater import *
 from datareader import *
@@ -58,6 +59,51 @@ def save_xmem_debug(debug_dir, frame_name, color, mask):
     )
 
 
+def get_mask_center(mask):
+    """Return the pixel centroid of a binary mask, or NaNs for an empty mask."""
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return float("nan"), float("nan")
+    return float(xs.mean()), float(ys.mean())
+
+
+def calculate_tracking_metrics(current_mask, cad_mask, mask_valid, image_width, image_height):
+    """Measure geometric agreement between the tracked mask and rendered CAD silhouette."""
+    mask_area = int(np.sum(current_mask)) if current_mask is not None else 0
+    cad_mask_area = int(np.sum(cad_mask))
+    mask_center_x, mask_center_y = (
+        get_mask_center(current_mask) if current_mask is not None else (float("nan"), float("nan"))
+    )
+    cad_center_x, cad_center_y = get_mask_center(cad_mask)
+
+    centers_valid = mask_valid and mask_area > 0 and cad_mask_area > 0
+    if centers_valid:
+        center_distance_px = float(
+            np.hypot(mask_center_x - cad_center_x, mask_center_y - cad_center_y)
+        )
+        center_distance_ratio = center_distance_px / float(
+            np.hypot(image_width, image_height)
+        )
+        mask_iou = float(compute_iou(current_mask, cad_mask))
+    else:
+        center_distance_px = float("inf")
+        center_distance_ratio = float("inf")
+        mask_iou = 0.0
+
+    return {
+        "mask_center_x": mask_center_x,
+        "mask_center_y": mask_center_y,
+        "cad_center_x": cad_center_x,
+        "cad_center_y": cad_center_y,
+        "center_distance_px": center_distance_px,
+        "center_distance_ratio": center_distance_ratio,
+        "mask_iou": mask_iou,
+        "mask_area": mask_area,
+        "cad_mask_area": cad_mask_area,
+        "mask_valid": bool(mask_valid),
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -85,6 +131,18 @@ if __name__ == "__main__":
         default=480,
         help="Resize the shorter image side to limit pose-scoring GPU memory use.",
     )
+    parser.add_argument(
+        "--relocalize_center_ratio",
+        type=float,
+        default=0.08,
+        help="Mark pose tracking lost above this normalized mask-center error.",
+    )
+    parser.add_argument(
+        "--relocalize_iou",
+        type=float,
+        default=0.30,
+        help="Mark pose tracking lost below this mask/CAD silhouette IoU.",
+    )
     args = parser.parse_args()
 
     set_logging_format()
@@ -107,6 +165,7 @@ if __name__ == "__main__":
     scorer = ScorePredictor()
     refiner = PoseRefinePredictor()
     glctx = dr.RasterizeCudaContext()
+    cad_mesh_tensors = make_mesh_tensors(mesh)
     est = FoundationPose(
         model_pts=mesh.vertices,
         model_normals=mesh.vertex_normals,
@@ -123,18 +182,38 @@ if __name__ == "__main__":
         video_dir=args.test_scene_dir, shorter_side=args.shorter_side, zfar=np.inf
     )
     xmem_tracker = XMemMaskTracker() if args.use_xmem else None
+    metrics_path = os.path.join(debug_dir, "tracking_metrics.csv")
+    metrics_file = open(metrics_path, "w", newline="")
+    metrics_fields = [
+        "frame_id",
+        "mask_center_x",
+        "mask_center_y",
+        "cad_center_x",
+        "cad_center_y",
+        "center_distance_px",
+        "center_distance_ratio",
+        "mask_iou",
+        "mask_area",
+        "cad_mask_area",
+        "mask_valid",
+        "tracking_state",
+    ]
+    metrics_writer = csv.DictWriter(metrics_file, fieldnames=metrics_fields)
+    metrics_writer.writeheader()
 
     for i in range(len(reader.color_files)):
         color = reader.get_color(i)
         expected_hw = (reader.H, reader.W)
         assert_frame_shapes(color, expected_hw)
+        current_mask = None
+        mask_valid = False
         if i == 0:
             mask = reader.get_mask(0).astype(bool)
             assert_frame_shapes(color, expected_hw, mask=mask)
             last_mask= mask
+            current_mask, mask_valid = normalize_xmem_mask(mask, expected_hw)
             if xmem_tracker is not None:
                 xmem_tracker.initialize(color, mask)
-                current_mask, mask_valid = normalize_xmem_mask(mask, expected_hw)
                 logging.info(
                     f"[XMEM] frame={i} valid={mask_valid} area={int(current_mask.sum())}"
                 )
@@ -193,12 +272,63 @@ if __name__ == "__main__":
                 rgb=color, depth=last_depth, K=reader.K, iteration=args.track_refine_iter
             )
             t2=time.time()
+
+        cad_mask = render_cad_silhouette(
+            pose,
+            mesh,
+            reader.K,
+            w=reader.W,
+            h=reader.H,
+            glctx=glctx,
+            mesh_tensors=cad_mesh_tensors,
+        )
+        assert_frame_shapes(color, expected_hw, mask=cad_mask)
+        metrics = calculate_tracking_metrics(
+            current_mask,
+            cad_mask,
+            mask_valid,
+            image_width=reader.W,
+            image_height=reader.H,
+        )
+        pose_bad = (
+            metrics["center_distance_ratio"] > args.relocalize_center_ratio
+            or metrics["mask_iou"] < args.relocalize_iou
+        )
+        if not mask_valid:
+            tracking_state = "LOST_MASK"
+        elif pose_bad:
+            tracking_state = "LOST"
+        else:
+            tracking_state = "TRACK"
+        metrics_writer.writerow(
+            {"frame_id": i, **metrics, "tracking_state": tracking_state}
+        )
+        metrics_file.flush()
+
         os.makedirs(f"{debug_dir}/ob_in_cam", exist_ok=True)
         np.savetxt(f"{debug_dir}/ob_in_cam/{reader.id_strs[i]}.txt", pose.reshape(4, 4))
 
         if debug >= 1:
             center_pose = pose @ np.linalg.inv(to_origin)
             color=cv2.putText(color, f"fps {int(1/(t2-t1))}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            color=cv2.putText(
+                color,
+                f"{tracking_state} IoU {metrics['mask_iou']:.3f}",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 0, 0),
+                2,
+            )
+            color=cv2.putText(
+                color,
+                f"center err {metrics['center_distance_px']:.1f}px ({metrics['center_distance_ratio']:.3f})",
+                (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 0, 0),
+                2,
+            )
             vis = draw_posed_3d_box(
                 reader.K, img=color, ob_in_cam=center_pose, bbox=bbox
             )
@@ -220,3 +350,5 @@ if __name__ == "__main__":
             imageio.imwrite(f"{debug_dir}/track_vis/{reader.id_strs[i]}.png", vis)
         if SAVE_VIDEO:
             video_writer.write(vis[..., ::-1])
+
+    metrics_file.close()

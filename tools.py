@@ -311,40 +311,39 @@ def render_cad_depth(pose, mesh_model, K, w=640, h=480):
 
     # Extract rotation and translation from the pose matrix
     
-def render_cad_mask(pose, mesh_model, K, w=640, h=480):
-    """
-    Renders the binary mask of the object based on its pose, CAD model, and camera parameters.
+def render_cad_silhouette(
+    pose, mesh_model, K, w=640, h=480, glctx=None, mesh_tensors=None
+):
+    """Render a deterministic CAD silhouette from nvdiffrast depth output."""
+    pose_tensor = torch.as_tensor(pose, dtype=torch.float32, device="cuda")
+    if pose_tensor.ndim == 2:
+        pose_tensor = pose_tensor.unsqueeze(0)
+    if mesh_tensors is None:
+        mesh_tensors = make_mesh_tensors(mesh_model)
+    if glctx is None:
+        glctx = dr.RasterizeCudaContext()
 
-    Args:
-        pose (np.ndarray): 4x4 transformation matrix of the object's pose.
-        mesh_model: Mesh object containing vertices of the CAD model.
-        K (np.ndarray): 3x3 intrinsic matrix of the camera.
-        w (int): Image width.
-        h (int): Image height.
-
-    Returns:
-        np.ndarray: Binary mask of the object (1 for object pixels, 0 for background).
-    """
-    # Load the vertices from the mesh model
-    vertices = np.array(mesh_model.vertices)
-    sample_indices = np.random.choice(len(vertices), size=500, replace=False)
-    vertices = vertices[sample_indices]
-
-    # Transform vertices with the object pose
-    transformed_vertices = (pose @ np.hstack((vertices, np.ones((vertices.shape[0], 1)))).T).T[:, :3]
-
-    # Project vertices to the 2D plane using the intrinsic matrix K
-    projected_points = (K @ transformed_vertices.T).T
-    projected_points = projected_points[:, :2] / projected_points[:, 2:3]  # Normalize by z
-
-    # Create a polygon from the projected 2D points
-    polygon = np.int32(projected_points).reshape((-1, 1, 2))
-
-    # Initialize a blank mask and draw the polygon
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(mask, [polygon], color=1)
-
+    depth = nvdiffrast_render_depthonly(
+        K=K,
+        H=h,
+        W=w,
+        ob_in_cams=pose_tensor,
+        context="cuda",
+        glctx=glctx,
+        mesh_tensors=mesh_tensors,
+        output_size=[h, w],
+    )
+    mask = (depth.squeeze() > 0).detach().cpu().numpy().astype(bool)
+    if mask.shape != (h, w):
+        raise ValueError(
+            f"CAD silhouette shape {mask.shape} does not match requested {(h, w)}"
+        )
     return mask
+
+
+def render_cad_mask(pose, mesh_model, K, w=640, h=480):
+    """Render the CAD object mask deterministically at the requested image size."""
+    return render_cad_silhouette(pose, mesh_model, K, w=w, h=h).astype(np.uint8)
 
 
 
